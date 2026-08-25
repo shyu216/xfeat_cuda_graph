@@ -68,10 +68,9 @@ xfeat-cuda-graph/
 │   └── weights/
 │       ├── xfeat.pt
 │       └── xfeat-lighterglue.pt
-├── notebooks/
-│   ├── 01_xfeat_cudagraph_benchmark       # XFeat: resolution sweep + bit-exactness
-│   ├── 02_lightglue_cudagraph_benchmark   # LG: sweep B, M, N → speedup
-│   └── 03_end_to_end_pipeline             # Full pipeline: XFeat + LG, eager vs CG
+├── 01_xfeat_cudagraph_benchmark       # XFeat: resolution sweep + bit-exactness
+├── 02_lightglue_cudagraph_benchmark   # LG: sweep B, M, N → speedup
+├── 03_end_to_end_pipeline             # Full pipeline: XFeat + LG, eager vs CG
 └── README.md
 ```
 
