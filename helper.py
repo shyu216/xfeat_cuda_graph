@@ -552,10 +552,13 @@ def replay_cg_lightglue(
     cg : dict
         Returned by ``capture_cg_lightglue``.
     d0_list, d1_list : list[dict]
-        Each element is a XFeat output dict:
+        Each element is a XFeat output dict whose **values are torch.Tensor**:
         ``{'keypoints': (K0, 2), 'descriptors': (K0, 64), 'scores': (K0,),
-          'image_size': (W, H)}``.
-        Length must equal captured ``B = len(d0_list) = len(d1_list)``.
+          'image_size': (2,) long}``.
+        Every field is coerced onto ``cg``'s device inside this function, so
+        CPU tensors (or even numpy arrays) are tolerated, but passing device
+        tensors avoids an extra host<->device copy.  Length must equal the
+        captured ``B = len(d0_list) = len(d1_list)``.
     min_conf : float
         Match confidence threshold. **Ignored at replay time** — the threshold
         is baked into the captured graph via ``model.net.conf.filter_threshold``,
@@ -576,6 +579,7 @@ def replay_cg_lightglue(
     Bc, Mc, Nc = cg["B"], cg["M"], cg["N"]
     B = len(d0_list)
     assert B == Bc, f"Batch size mismatch: got {B}, expected {Bc}"
+    assert B == len(d1_list), "d0_list and d1_list must have equal length"
 
     # Zero output buffers
     bufs["kpts0"].zero_(); bufs["desc0"].zero_(); bufs["mask0"].zero_()
@@ -583,40 +587,37 @@ def replay_cg_lightglue(
 
     dev = bufs["kpts0"].device
 
-    # Fill each batch element by sorting top-M by score
+    # Fill each batch element by sorting top-M by score.
+    # Each field is coerced to a device tensor FIRST ("先变成 tensor 再调用")
+    # before it is written into the static CUDA-Graph buffers.
     for b in range(B):
-        # Left image 0: take top-M by score
+        # --- Left image 0: take top-M by score ---
         d0 = d0_list[b]
-        kpts0_cpu = d0['keypoints']  # (K0, 2) on CPU from XFeat
-        desc0_cpu = d0['descriptors']  # (K0, 64)
-        scores0 = d0['scores']  # (K0,) higher = better
-        n0 = min(len(scores0), Mc)
+        kpts0 = torch.as_tensor(d0['keypoints'], device=dev)
+        desc0 = torch.as_tensor(d0['descriptors'], device=dev)
+        scores0 = torch.as_tensor(d0['scores'], device=dev)
+        n0 = min(int(scores0.shape[0]), Mc)
 
         if n0 > 0:
-            # Sort descending by score and take top-M
             idxs0 = (-scores0).argsort()[:n0]
-            kpts0_t = torch.as_tensor(kpts0_cpu[idxs0], device=dev)
-            desc0_t = torch.as_tensor(desc0_cpu[idxs0], device=dev)
-            bufs["kpts0"][b, :n0] = kpts0_t
-            bufs["desc0"][b, :n0] = desc0_t
+            bufs["kpts0"][b, :n0] = kpts0[idxs0]
+            bufs["desc0"][b, :n0] = desc0[idxs0]
             bufs["mask0"][b, :n0, 0] = True
-        bufs["size0"][b] = torch.tensor(d0['image_size'], dtype=torch.long, device=dev)
+        bufs["size0"][b] = torch.as_tensor(d0['image_size'], dtype=torch.long, device=dev)
 
-        # Right image 1: take top-N by score
+        # --- Right image 1: take top-N by score ---
         d1 = d1_list[b]
-        kpts1_cpu = d1['keypoints']
-        desc1_cpu = d1['descriptors']
-        scores1 = d1['scores']
-        n1 = min(len(scores1), Nc)
+        kpts1 = torch.as_tensor(d1['keypoints'], device=dev)
+        desc1 = torch.as_tensor(d1['descriptors'], device=dev)
+        scores1 = torch.as_tensor(d1['scores'], device=dev)
+        n1 = min(int(scores1.shape[0]), Nc)
 
         if n1 > 0:
             idxs1 = (-scores1).argsort()[:n1]
-            kpts1_t = torch.as_tensor(kpts1_cpu[idxs1], device=dev)
-            desc1_t = torch.as_tensor(desc1_cpu[idxs1], device=dev)
-            bufs["kpts1"][b, :n1] = kpts1_t
-            bufs["desc1"][b, :n1] = desc1_t
+            bufs["kpts1"][b, :n1] = kpts1[idxs1]
+            bufs["desc1"][b, :n1] = desc1[idxs1]
             bufs["mask1"][b, :n1, 0] = True
-        bufs["size1"][b] = torch.tensor(d1['image_size'], dtype=torch.long, device=dev)
+        bufs["size1"][b] = torch.as_tensor(d1['image_size'], dtype=torch.long, device=dev)
 
     # Replay the graph
     cg["graph"].replay()
@@ -645,16 +646,20 @@ def replay_cg_lightglue(
         d0_orig = d0_list[b]
         d1_orig = d1_list[b]
         if len(matches_b) > 0:
-            orig_idx0 = (-d0_orig['scores']).argsort()[:Mc]
-            orig_idx1 = (-d1_orig['scores']).argsort()[:Nc]
-            idxs0_cpu = idxs0_buf.cpu().numpy() if isinstance(idxs0_buf, torch.Tensor) else idxs0_buf
-            idxs1_cpu = idxs1_buf.cpu().numpy() if isinstance(idxs1_buf, torch.Tensor) else idxs1_buf
-            pts0 = d0_orig['keypoints'][orig_idx0[idxs0_cpu]]
-            pts1 = d1_orig['keypoints'][orig_idx1[idxs1_cpu]]
-            idxs_out = np.stack([np.asarray(orig_idx0[idxs0_cpu]),
-                             np.asarray(orig_idx1[idxs1_cpu])], axis=1)
-            results.append((np.asarray(pts0), np.asarray(pts1),
-                            idxs_out, mean_score))
+            kpts0_full = torch.as_tensor(d0_orig['keypoints'], device=dev)
+            kpts1_full = torch.as_tensor(d1_orig['keypoints'], device=dev)
+            scores0_full = torch.as_tensor(d0_orig['scores'], device=dev)
+            scores1_full = torch.as_tensor(d1_orig['scores'], device=dev)
+
+            orig_idx0 = (-scores0_full).argsort()[:Mc]
+            orig_idx1 = (-scores1_full).argsort()[:Nc]
+            idxs0_np = idxs0_buf.cpu().numpy().astype(np.int64)
+            idxs1_np = idxs1_buf.cpu().numpy().astype(np.int64)
+            pts0 = kpts0_full[orig_idx0[idxs0_np]].cpu().numpy()
+            pts1 = kpts1_full[orig_idx1[idxs1_np]].cpu().numpy()
+            idxs_out = np.stack([orig_idx0[idxs0_np].cpu().numpy(),
+                                 orig_idx1[idxs1_np].cpu().numpy()], axis=1)
+            results.append((pts0, pts1, idxs_out, mean_score))
         else:
             results.append((np.empty((0, 2), dtype=np.float32),
                             np.empty((0, 2), dtype=np.float32),
