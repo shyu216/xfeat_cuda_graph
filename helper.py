@@ -557,7 +557,10 @@ def replay_cg_lightglue(
           'image_size': (W, H)}``.
         Length must equal captured ``B = len(d0_list) = len(d1_list)``.
     min_conf : float
-        Match confidence threshold (passed to LightGlue).
+        Match confidence threshold. **Ignored at replay time** — the threshold
+        is baked into the captured graph via ``model.net.conf.filter_threshold``,
+        so it must be set on the model BEFORE ``capture_cg_lightglue``.  Kept
+        only for API compatibility with ``XFeat.match_lighterglue``.
 
     Returns
     -------
@@ -622,23 +625,30 @@ def replay_cg_lightglue(
     # Post-process: collect matches back to original coordinate space
     results = []
     for b in range(B):
-        # Get matched indices from the padded top-(M/N)
+        # Get matched buffer positions:
+        #   matches_b = side0 buffer positions i that have a match
+        #   m0[b][i]  = matched side1 buffer position j
+        # (m1 is the inverse mapping and must NOT be used here — doing so
+        #  would index the wrong side and scramble the output. That was the
+        #  original bug: idxs0 was set to m0[matches_b] but then indexed
+        #  orig_idx0, while idxs1 was set to m1[matches_b], which is garbage.)
         matches_b = (m0[b] != -1).nonzero().squeeze(1)
-        idxs0 = m0[b][matches_b]  # indices into our sorted top-M buffer
-        idxs1 = m1[b][matches_b]  # indices into our sorted top-N buffer
+        idxs0_buf = matches_b                       # side0 buffer positions
+        idxs1_buf = m0[b][matches_b]                # side1 buffer positions
         mean_score = 0.0
         if len(matches_b) > 0:
             mean_score = float(ms0[b][matches_b].mean().item())
 
-        # Map back to original (pre-top-M/N) keypoints
+        # Map buffer positions back to ORIGINAL (pre-top-M/N) keypoints.
+        # The fill step sorted each side by score and placed original index
+        # orig_idx_s[p] at buffer position p, so orig_idx_s[p] recovers it.
         d0_orig = d0_list[b]
         d1_orig = d1_list[b]
         if len(matches_b) > 0:
-            # idxs0 -> original indices = original_sorted[idxs0]
             orig_idx0 = (-d0_orig['scores']).argsort()[:Mc]
             orig_idx1 = (-d1_orig['scores']).argsort()[:Nc]
-            idxs0_cpu = idxs0.cpu().numpy() if isinstance(idxs0, torch.Tensor) else idxs0
-            idxs1_cpu = idxs1.cpu().numpy() if isinstance(idxs1, torch.Tensor) else idxs1
+            idxs0_cpu = idxs0_buf.cpu().numpy() if isinstance(idxs0_buf, torch.Tensor) else idxs0_buf
+            idxs1_cpu = idxs1_buf.cpu().numpy() if isinstance(idxs1_buf, torch.Tensor) else idxs1_buf
             pts0 = d0_orig['keypoints'][orig_idx0[idxs0_cpu]]
             pts1 = d1_orig['keypoints'][orig_idx1[idxs1_cpu]]
             idxs_out = np.stack([np.asarray(orig_idx0[idxs0_cpu]),
